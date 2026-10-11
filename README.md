@@ -151,6 +151,8 @@ codex-auto version
 
 In an interactive terminal, `codex-auto` periodically checks npm for a newer `codex-auto` release. When one is available, it prompts you to update now, skip that version, or postpone the reminder. Set `CODEX_AUTO_UPDATE_CHECK=0` to disable the check.
 
+When resuming, recorded quota errors with an unambiguously elapsed reset time are treated as history until a new user turn is submitted. Fresh errors, future resets, and errors without reliable reset metadata still use normal quota handling. A nonzero Codex exit retains startup-error detection.
+
 ## Staying on One Account
 
 Use `--skip-failover` to run with only the selected account, keeping the managed session home and history:

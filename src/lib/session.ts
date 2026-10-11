@@ -6,7 +6,7 @@ import { spawn as spawnPty } from 'node-pty';
 import path from 'node:path';
 import { createSessionLogger } from './logger.js';
 import { buildCodexShellCommand, resolveCodexCommand } from './codex-bin.js';
-import { extractQuotaRetryAvailability, getOutputSinceLatestPrompt, hasQuotaError, sanitizeTerminalOutput } from './detection.js';
+import { extractQuotaRetryAvailability, getOutputSinceLatestPrompt, hasQuotaError, sanitizeTerminalOutput, removeHistoricalQuotaMessages } from './detection.js';
 import { markAccountUsed } from './accounts.js';
 import { readTextIfExists } from './fs.js';
 import { accountAuthPath, instanceHome, resolveCodexHome } from './paths.js';
@@ -489,6 +489,32 @@ async function collectSessionFiles(root: string): Promise<string[]> {
   }
 }
 
+async function readExpiredSessionQuotaMessages(instanceDir: string, sessionId: string): Promise<string[]> {
+  const messages: string[] = [];
+  for (const file of await collectSessionFiles(path.join(instanceDir, 'sessions'))) {
+    const text = await readTextIfExists(file).catch(() => null);
+    if (!text) continue;
+    const lines = text.split('\n');
+    try {
+      const meta = JSON.parse(lines[0] ?? '{}');
+      if (meta.type !== 'session_meta' || meta.payload?.id !== sessionId) continue;
+    } catch { continue; }
+    for (const line of lines.slice(1)) {
+      try {
+        const entry = JSON.parse(line);
+        const message = entry.type === 'event_msg' ? entry.payload?.error?.message : null;
+        const recordedAt = new Date(entry.timestamp);
+        if (typeof message !== 'string' || !hasQuotaError(message) || !Number.isFinite(recordedAt.getTime())) continue;
+        const retry = extractQuotaRetryAvailability(message, recordedAt);
+        // A date without a year is ambiguous (native parsing may assume 2001).
+        const unambiguousReset = retry && (/^\d{1,2}:\d{2}\s*[AP]M$/i.test(retry.displayText) || /\b\d{4}\b/.test(retry.displayText));
+        if (unambiguousReset && Date.parse(retry.availableAt) <= Date.now()) messages.push(message);
+      } catch { /* Partial/unknown records are not evidence of an expired limit. */ }
+    }
+  }
+  return [...new Set(messages)];
+}
+
 async function readSessionCandidatesFromFilesByMtime(
   instanceDir: string,
   since: number
@@ -568,6 +594,7 @@ async function launchResumeInvocation(options: {
   stdout: OutputLike;
   interactive: boolean;
   sessionId: string;
+  historicalQuotaMessages?: string[];
 }): Promise<InvocationResult> {
   return launchInvocation({
     appHome: options.appHome,
@@ -575,6 +602,7 @@ async function launchResumeInvocation(options: {
     workspaceDir: options.workspaceDir,
     codexCommand: options.codexCommand,
     args: ['resume', '--no-alt-screen', options.sessionId, 'Continue'],
+    historicalQuotaMessages: options.historicalQuotaMessages,
     env: options.env,
     stdin: options.stdin,
     stdout: options.stdout,
@@ -593,12 +621,14 @@ async function launchInvocation(options: {
   stdout: OutputLike;
   interactive: boolean;
   skipFailover?: boolean;
+  historicalQuotaMessages?: string[];
 }): Promise<InvocationResult> {
   const command = buildCodexShellCommand(options.codexCommand, options.args);
   const shell = options.env.SHELL || '/bin/zsh';
   const stdout = options.stdout;
   let sanitizedOutput = '';
   let quotaRelevantOutput = '';
+  let historyReplayComplete = false;
   let pendingPrePromptQuotaTimer: NodeJS.Timeout | null = null;
   let pendingPostPromptQuotaTimer: NodeJS.Timeout | null = null;
 
@@ -620,12 +650,15 @@ async function launchInvocation(options: {
     pendingPostPromptQuotaTimer = null;
   };
 
-  const evaluateQuotaOutput = (): {
+  const evaluateQuotaOutput = (includeHistoricalErrors = false): {
     quotaError: boolean;
     sawPrompt: boolean;
     relevantOutput: string;
   } => {
-    const outputSinceLatestPrompt = getOutputSinceLatestPrompt(sanitizedOutput);
+    const quotaOutput = historyReplayComplete || includeHistoricalErrors
+      ? sanitizedOutput
+      : removeHistoricalQuotaMessages(sanitizedOutput, options.historicalQuotaMessages ?? []);
+    const outputSinceLatestPrompt = getOutputSinceLatestPrompt(quotaOutput);
     if (outputSinceLatestPrompt !== null) {
       return {
         quotaError: hasQuotaError(outputSinceLatestPrompt),
@@ -635,9 +668,9 @@ async function launchInvocation(options: {
     }
 
     return {
-      quotaError: hasQuotaError(sanitizedOutput),
+      quotaError: hasQuotaError(quotaOutput),
       sawPrompt: false,
-      relevantOutput: sanitizedOutput
+      relevantOutput: quotaOutput
     };
   };
 
@@ -715,6 +748,11 @@ async function launchInvocation(options: {
         return;
       }
 
+      if (options.historicalQuotaMessages?.length && /[\r\n]/.test(input)) {
+        historyReplayComplete = true;
+        // Drop replayed output before accepting a new user turn.
+        sanitizedOutput = '';
+      }
       ptyProcess.write(input);
     };
     const stdoutResizeHandler = (): void => {
@@ -810,7 +848,7 @@ async function launchInvocation(options: {
               quotaError: true,
               relevantOutput: quotaRelevantOutput
             }
-          : evaluateQuotaOutput();
+          : evaluateQuotaOutput(exitCode !== 0);
         resolve({
           exitCode,
           quotaError: finalEvaluation.quotaError,
@@ -950,7 +988,7 @@ async function launchInvocation(options: {
             quotaError: true,
             relevantOutput: quotaRelevantOutput
           }
-        : evaluateQuotaOutput();
+        : evaluateQuotaOutput(code !== null && code !== 0);
       resolve({
         exitCode: code ?? 1,
         quotaError: finalEvaluation.quotaError,
@@ -1063,6 +1101,9 @@ export async function runManagedSession(options: RunManagedSessionOptions): Prom
       });
 
       const firstRunArgs = buildFirstRunArgs(options.extraArgs ?? []);
+      const historicalQuotaMessages = lastSessionId
+        ? await readExpiredSessionQuotaMessages(instanceDir, lastSessionId)
+        : [];
 
       const result: InvocationResult = firstRun
         ? await launchInvocation({
@@ -1072,6 +1113,7 @@ export async function runManagedSession(options: RunManagedSessionOptions): Prom
             codexCommand,
             args: firstRunArgs,
             skipFailover: options.skipFailover,
+            historicalQuotaMessages,
             env,
             stdin,
             stdout,
@@ -1086,7 +1128,8 @@ export async function runManagedSession(options: RunManagedSessionOptions): Prom
             stdin,
             stdout,
             interactive,
-            sessionId: lastSessionId as string
+            sessionId: lastSessionId as string,
+            historicalQuotaMessages
           });
 
       const discoveredSessionId: string | null = firstRun && !lastSessionId
