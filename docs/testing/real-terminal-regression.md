@@ -230,3 +230,16 @@ codex-auto
   - 跑了哪些自动化测试
   - 做了哪些真实终端回归
   - 真实终端回归使用了什么终端环境（例如 Terminal.app、iTerm2、分屏）
+
+
+### 单账号运行与历史额度提示
+
+使用最新构建，在测试账号/合成 CLI 环境中检查：
+
+- `codex-auto --skip-failover --account <name>` 遇到真实额度提示时，不中断仍在运行的 Codex，也不启动其他账号。
+- `codex-auto --skip-failover resume <session-id>` 回放旧额度提示时，仍可到达输入提示符；重复 resume 不应轮换账号。
+- 同时指定其他透传参数时，`--skip-failover` 不传给 Codex，其余参数保持不变。
+- Codex 以非零状态退出时，显示错误并结束本次运行；会话仍可手动 resume。
+- 不指定 `--skip-failover` 时，原有额度切换行为不变。
+
+此清单需要真实终端验收，自动化合成测试不能替代。

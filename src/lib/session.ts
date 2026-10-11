@@ -26,6 +26,7 @@ export type RunManagedSessionOptions = {
   codexHome?: string;
   workspaceDir: string;
   preferredAccountName?: string;
+  skipFailover?: boolean;
   extraArgs?: string[];
   codexCommand?: string;
   env?: NodeJS.ProcessEnv;
@@ -591,6 +592,7 @@ async function launchInvocation(options: {
   stdin: NodeJS.ReadStream;
   stdout: OutputLike;
   interactive: boolean;
+  skipFailover?: boolean;
 }): Promise<InvocationResult> {
   const command = buildCodexShellCommand(options.codexCommand, options.args);
   const shell = options.env.SHELL || '/bin/zsh';
@@ -725,6 +727,7 @@ async function launchInvocation(options: {
     const restoreTerminal = enterRawMode(options.stdin);
 
     const handlePotentialQuota = (): void => {
+      if (options.skipFailover) return;
       if (quotaDetected) {
         return;
       }
@@ -841,6 +844,7 @@ async function launchInvocation(options: {
   };
 
   const triggerQuotaRotation = (): void => {
+    if (options.skipFailover) return;
     if (quotaDetected) {
       return;
     }
@@ -1067,6 +1071,7 @@ export async function runManagedSession(options: RunManagedSessionOptions): Prom
             workspaceDir: options.workspaceDir,
             codexCommand,
             args: firstRunArgs,
+            skipFailover: options.skipFailover,
             env,
             stdin,
             stdout,
@@ -1159,6 +1164,26 @@ export async function runManagedSession(options: RunManagedSessionOptions): Prom
           switchCount,
           exitCode: result.exitCode || 130,
           exhaustedAll: false
+        };
+      }
+
+      if (options.skipFailover && result.quotaError) {
+        const latestState = await loadState(options.appHome);
+        latestState.currentIndex = current.index;
+        if (lastSessionId) latestState.lastSessionId = lastSessionId;
+        if (result.retryAvailability) {
+          latestState.retryAvailabilityByAccount[current.name] = result.retryAvailability;
+        }
+        await saveState(options.appHome, latestState);
+        stderr.write(`\n[codex-auto] Automatic failover disabled; staying on ${current.name}. No other account was started.\n`);
+        await logger.log('quota_no_failover', { account: current.name, exitCode: result.exitCode, instanceId });
+        await writeManagedRunState(options.appHome, {
+          runId, pid: process.pid, workspaceDir: options.workspaceDir,
+          startedAt: runStartedAt, status: 'failed', currentAccount: current.name,
+          currentSessionId: lastSessionId, sessionBindingLost
+        });
+        return {
+          finalAccount: current.name, switchCount, exitCode: result.exitCode || 1, exhaustedAll: false
         };
       }
 

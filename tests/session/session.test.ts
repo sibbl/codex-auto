@@ -79,6 +79,68 @@ class TtyInputStream extends PassThrough {
 }
 
 describe('managed session runner', () => {
+  test.each([false, true])('skip-failover allows delayed resume replay without killing it (interactive=%s)', async (interactive) => {
+    const appHome = await createTempAppHome();
+    const codexHome = await createTempAppHome('codex-home-');
+    const logPath = path.join(appHome, 'fake.log');
+    const sessionId = 'synthetic-replay';
+    try {
+      await seedCodexHome(codexHome);
+      await seedExistingSession(codexHome, { id: sessionId, updatedAt: '2026-04-17T00:00:00Z' });
+      await seedState(appHome, {
+        version: 1, accounts: ['a', 'b'], currentIndex: 0,
+        preferredAccountName: 'a', lastSuccessfulAccount: null, lastSessionId: sessionId,
+        updatedAt: new Date().toISOString()
+      });
+      await seedAccount(appHome, 'a', { account: 'a', token: 'synthetic-a' });
+      await seedAccount(appHome, 'b', { account: 'b', token: 'synthetic-b' });
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const result = await runManagedSession({
+          appHome, codexHome, workspaceDir: process.cwd(), skipFailover: true,
+          codexCommand: `node ${path.resolve('tests/fixtures/fake-codex.mjs')}`,
+          extraArgs: ['--yolo', 'resume', sessionId],
+          env: { ...process.env, FAKE_CODEX_LOG: logPath,
+            FAKE_CODEX_RESUME_DELAYED_QUOTA_REPLAY: '1', FAKE_CODEX_LIVE_PROMPT_DELAY_MS: '700' },
+          interactive,
+          ...(interactive ? { stdin: new TtyInputStream() as unknown as NodeJS.ReadStream, stdout: new TtyCaptureStream() } : {})
+        });
+        expect(result).toMatchObject({ switchCount: 0, exhaustedAll: false, exitCode: 0, finalAccount: 'a' });
+      }
+      expect((await readFile(logPath, 'utf8')).trim().split('\n')).toHaveLength(2);
+      expect((await loadState(appHome)).retryAvailabilityByAccount).toEqual({});
+    } finally {
+      await cleanupTempDir(appHome);
+      await cleanupTempDir(codexHome);
+    }
+  });
+
+  test('skip-failover surfaces fresh quota after prompt without rotation', async () => {
+    const appHome = await createTempAppHome();
+    const codexHome = await createTempAppHome('codex-home-');
+    const logPath = path.join(appHome, 'fake.log');
+    try {
+      await seedCodexHome(codexHome);
+      await seedState(appHome, {
+        version: 1, accounts: ['b', 'c'], currentIndex: 0,
+        preferredAccountName: 'b', lastSuccessfulAccount: null, lastSessionId: null,
+        updatedAt: new Date().toISOString()
+      });
+      await seedAccount(appHome, 'b', { account: 'b', token: 'synthetic-b' });
+      await seedAccount(appHome, 'c', { account: 'c', token: 'synthetic-c' });
+      const result = await runManagedSession({
+        appHome, codexHome, workspaceDir: process.cwd(), skipFailover: true,
+        codexCommand: `node ${path.resolve('tests/fixtures/fake-codex.mjs')}`,
+        env: { ...process.env, FAKE_CODEX_LOG: logPath, FAKE_CODEX_EMIT_QUOTA_AFTER_PROMPT: '1', FAKE_CODEX_REPLAY_OLD_QUOTA_BEFORE_PROMPT: '1' },
+        interactive: false
+      });
+      expect(result).toMatchObject({ switchCount: 0, exhaustedAll: false, exitCode: 1, finalAccount: 'b' });
+      expect((await readFile(logPath, 'utf8')).trim().split('\n')).toHaveLength(1);
+    } finally {
+      await cleanupTempDir(appHome);
+      await cleanupTempDir(codexHome);
+    }
+  });
+
   test('switches accounts and resumes with persisted session id after quota failure', async () => {
     const appHome = await createTempAppHome();
     const codexHome = await createTempAppHome('codex-home-');
